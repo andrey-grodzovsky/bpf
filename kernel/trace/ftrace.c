@@ -327,6 +327,27 @@ static int remove_ftrace_ops(struct ftrace_ops __rcu **list,
 
 static void ftrace_update_trampoline(struct ftrace_ops *ops);
 
+/*
+ * Return true if @hash contains any entry that opted in to permanence.
+ * Used to refuse attaching a permanent callback while ftrace_enabled==0.
+ */
+static bool filter_hash_has_permanent(struct ftrace_hash *hash)
+{
+	struct ftrace_func_entry *entry;
+	int size, i;
+
+	if (!FTRACE_FL_PERMANENT_SUPPORTED || ftrace_hash_empty(hash))
+		return false;
+
+	size = 1 << hash->size_bits;
+	for (i = 0; i < size; i++)
+		hlist_for_each_entry(entry, &hash->buckets[i], hlist)
+			if (entry->permanent)
+				return true;
+
+	return false;
+}
+
 int __register_ftrace_function(struct ftrace_ops *ops)
 {
 	if (ops->flags & FTRACE_OPS_FL_DELETED)
@@ -348,7 +369,16 @@ int __register_ftrace_function(struct ftrace_ops *ops)
 	if (ops->flags & FTRACE_OPS_FL_SAVE_REGS_IF_SUPPORTED)
 		ops->flags |= FTRACE_OPS_FL_SAVE_REGS;
 #endif
-	if (!ftrace_enabled && (ops->flags & FTRACE_OPS_FL_PERMANENT))
+	/*
+	 * Refuse registering a permanent callback while ftrace is disabled.
+	 * Permanence is requested either at the ops level (livepatch, s390
+	 * test_unwind) or per-entry via the ops's filter hash (kprobes-on-
+	 * ftrace first attach, and any direct callers routed through here).
+	 */
+	if (!ftrace_enabled &&
+	    ((ops->flags & FTRACE_OPS_FL_PERMANENT) ||
+	     (ops->func_hash &&
+	      filter_hash_has_permanent(ops->func_hash->filter_hash))))
 		return -EBUSY;
 
 	if (!is_kernel_core_data((unsigned long)ops))
@@ -1210,7 +1240,8 @@ void add_ftrace_hash_entry(struct ftrace_hash *hash, struct ftrace_func_entry *e
 }
 
 struct ftrace_func_entry *
-add_ftrace_hash_entry_direct(struct ftrace_hash *hash, unsigned long ip, unsigned long direct)
+add_ftrace_hash_entry_direct(struct ftrace_hash *hash, unsigned long ip, unsigned long direct,
+			     bool permanent)
 {
 	struct ftrace_func_entry *entry;
 
@@ -1220,6 +1251,7 @@ add_ftrace_hash_entry_direct(struct ftrace_hash *hash, unsigned long ip, unsigne
 
 	entry->ip = ip;
 	entry->direct = direct;
+	entry->permanent = permanent;
 	add_ftrace_hash_entry(hash, entry);
 
 	return entry;
@@ -1228,7 +1260,7 @@ add_ftrace_hash_entry_direct(struct ftrace_hash *hash, unsigned long ip, unsigne
 static struct ftrace_func_entry *
 add_hash_entry(struct ftrace_hash *hash, unsigned long ip)
 {
-	return add_ftrace_hash_entry_direct(hash, ip, 0);
+	return add_ftrace_hash_entry_direct(hash, ip, 0, false);
 }
 
 static void
@@ -1403,7 +1435,7 @@ static int ftrace_add_mod(struct trace_array *tr,
 static struct ftrace_hash *
 alloc_and_copy_ftrace_hash(int size_bits, struct ftrace_hash *hash)
 {
-	struct ftrace_func_entry *entry;
+	struct ftrace_func_entry *entry, *new_entry;
 	struct ftrace_hash *new_hash;
 	int size;
 	int i;
@@ -1422,7 +1454,9 @@ alloc_and_copy_ftrace_hash(int size_bits, struct ftrace_hash *hash)
 	size = 1 << hash->size_bits;
 	for (i = 0; i < size; i++) {
 		hlist_for_each_entry(entry, &hash->buckets[i], hlist) {
-			if (add_ftrace_hash_entry_direct(new_hash, entry->ip, entry->direct) == NULL)
+			new_entry = add_ftrace_hash_entry_direct(new_hash, entry->ip,
+								 entry->direct, entry->permanent);
+			if (new_entry == NULL)
 				goto free_hash;
 		}
 	}
@@ -1752,6 +1786,45 @@ static bool test_rec_ops_needs_regs(struct dyn_ftrace *rec)
 	return  keep_regs;
 }
 
+/*
+ * Test if any ops registered to this rec (other than @exclude) still keeps
+ * it permanent. An ops keeps a rec permanent either because it carries the
+ * ops-level FTRACE_OPS_FL_PERMANENT flag (livepatch, s390 test_unwind), or
+ * because the matching filter_hash entry for this ip opted in per-attachment
+ * (BPF trampolines, kprobes-on-ftrace).
+ *
+ * @exclude is the ops currently being detached: at that point its old
+ * filter_hash still contains this ip, so it must be skipped to avoid
+ * counting the attachment that is going away.
+ */
+static bool test_rec_ops_needs_permanent(struct dyn_ftrace *rec,
+					 struct ftrace_ops *exclude)
+{
+	struct ftrace_func_entry *entry;
+	struct ftrace_ops *ops;
+
+	if (!FTRACE_FL_PERMANENT_SUPPORTED)
+		return false;
+
+	for (ops = ftrace_ops_list;
+	     ops != &ftrace_list_end; ops = ops->next) {
+		if (ops == exclude)
+			continue;
+		if (!(ops->flags & FTRACE_OPS_FL_ENABLED))
+			continue;
+		if (!ops->func_hash)
+			continue;
+		if ((ops->flags & FTRACE_OPS_FL_PERMANENT) &&
+		    hash_contains_ip(rec->ip, ops->func_hash))
+			return true;
+		entry = ftrace_lookup_ip(ops->func_hash->filter_hash, rec->ip);
+		if (entry && entry->permanent)
+			return true;
+	}
+
+	return false;
+}
+
 static struct ftrace_ops *
 ftrace_find_tramp_ops_any(struct dyn_ftrace *rec);
 static struct ftrace_ops *
@@ -1806,6 +1879,7 @@ static bool __ftrace_hash_rec_update(struct ftrace_ops *ops,
 		all = true;
 
 	do_for_each_ftrace_rec(pg, rec) {
+		struct ftrace_func_entry *entry = NULL;
 		int in_notrace_hash = 0;
 		int in_hash = 0;
 		int match = 0;
@@ -1821,7 +1895,8 @@ static bool __ftrace_hash_rec_update(struct ftrace_ops *ops,
 			if (!notrace_hash || !ftrace_lookup_ip(notrace_hash, rec->ip))
 				match = 1;
 		} else {
-			in_hash = !!ftrace_lookup_ip(hash, rec->ip);
+			entry = ftrace_lookup_ip(hash, rec->ip);
+			in_hash = !!entry;
 			in_notrace_hash = !!ftrace_lookup_ip(notrace_hash, rec->ip);
 
 			/*
@@ -1864,6 +1939,17 @@ static bool __ftrace_hash_rec_update(struct ftrace_ops *ops,
 			 */
 			if (ops->flags & FTRACE_OPS_FL_SAVE_REGS)
 				rec->flags |= FTRACE_FL_REGS;
+
+			/*
+			 * If the attaching ops carries the permanent flag, or
+			 * this specific filter entry opted in, mark the record
+			 * so that kernel.ftrace_enabled=0 is refused while it
+			 * remains attached.
+			 */
+			if (FTRACE_FL_PERMANENT_SUPPORTED &&
+			    ((ops->flags & FTRACE_OPS_FL_PERMANENT) ||
+			     (entry && entry->permanent)))
+				rec->flags |= FTRACE_FL_PERMANENT;
 		} else {
 			if (FTRACE_WARN_ON(ftrace_rec_count(rec) == 0))
 				return false;
@@ -1889,6 +1975,20 @@ static bool __ftrace_hash_rec_update(struct ftrace_ops *ops,
 			    ops->flags & FTRACE_OPS_FL_SAVE_REGS) {
 				if (!test_rec_ops_needs_regs(rec))
 					rec->flags &= ~FTRACE_FL_REGS;
+			}
+
+			/*
+			 * If the rec was permanent, re-check whether any other
+			 * remaining attacher still keeps it permanent before
+			 * clearing (analogous to the REGS handling above). When
+			 * the count reaches zero, ftrace_check_record() clears
+			 * all non-preserved flags anyway.
+			 */
+			if (FTRACE_FL_PERMANENT_SUPPORTED &&
+			    ftrace_rec_count(rec) > 0 &&
+			    (rec->flags & FTRACE_FL_PERMANENT)) {
+				if (!test_rec_ops_needs_permanent(rec, ops))
+					rec->flags &= ~FTRACE_FL_PERMANENT;
 			}
 
 			/*
@@ -5871,7 +5971,8 @@ ftrace_notrace_write(struct file *file, const char __user *ubuf,
 }
 
 static int
-__ftrace_match_addr(struct ftrace_hash *hash, unsigned long ip, int remove)
+__ftrace_match_addr(struct ftrace_hash *hash, unsigned long ip, int remove,
+		    bool permanent)
 {
 	struct ftrace_func_entry *entry;
 
@@ -5885,24 +5986,30 @@ __ftrace_match_addr(struct ftrace_hash *hash, unsigned long ip, int remove)
 			return -ENOENT;
 		free_hash_entry(hash, entry);
 		return 0;
-	} else if (__ftrace_lookup_ip(hash, ip) != NULL) {
+	} else if ((entry = __ftrace_lookup_ip(hash, ip)) != NULL) {
 		/* Already exists */
+		if (permanent)
+			entry->permanent = true;
 		return 0;
 	}
 
 	entry = add_hash_entry(hash, ip);
-	return entry ? 0 :  -ENOMEM;
+	if (!entry)
+		return -ENOMEM;
+	if (permanent)
+		entry->permanent = true;
+	return 0;
 }
 
 static int
 ftrace_match_addr(struct ftrace_hash *hash, unsigned long *ips,
-		  unsigned int cnt, int remove)
+		  unsigned int cnt, int remove, bool permanent)
 {
 	unsigned int i;
 	int err;
 
 	for (i = 0; i < cnt; i++) {
-		err = __ftrace_match_addr(hash, ips[i], remove);
+		err = __ftrace_match_addr(hash, ips[i], remove, permanent);
 		if (err) {
 			/*
 			 * This expects the @hash is a temporary hash and if this
@@ -5917,7 +6024,7 @@ ftrace_match_addr(struct ftrace_hash *hash, unsigned long *ips,
 static int
 ftrace_set_hash(struct ftrace_ops *ops, unsigned char *buf, int len,
 		unsigned long *ips, unsigned int cnt,
-		int remove, int reset, int enable, char *mod)
+		int remove, int reset, int enable, char *mod, bool permanent)
 {
 	struct ftrace_hash **orig_hash;
 	struct ftrace_hash *hash;
@@ -5956,9 +6063,19 @@ ftrace_set_hash(struct ftrace_ops *ops, unsigned char *buf, int len,
 		goto out_regex_unlock;
 	}
 	if (ips) {
-		ret = ftrace_match_addr(hash, ips, cnt, remove);
+		ret = ftrace_match_addr(hash, ips, cnt, remove, permanent);
 		if (ret < 0)
 			goto out_regex_unlock;
+	}
+
+	/*
+	 * Refuse installing a permanent filter entry while ftrace is
+	 * disabled (mirrors the register-time gate for callers that update
+	 * an already-registered ops).
+	 */
+	if (permanent && !remove && !ftrace_enabled) {
+		ret = -EBUSY;
+		goto out_regex_unlock;
 	}
 
 	mutex_lock(&ftrace_lock);
@@ -5974,9 +6091,10 @@ ftrace_set_hash(struct ftrace_ops *ops, unsigned char *buf, int len,
 
 static int
 ftrace_set_addr(struct ftrace_ops *ops, unsigned long *ips, unsigned int cnt,
-		int remove, int reset, int enable)
+		int remove, int reset, int enable, bool permanent)
 {
-	return ftrace_set_hash(ops, NULL, 0, ips, cnt, remove, reset, enable, NULL);
+	return ftrace_set_hash(ops, NULL, 0, ips, cnt, remove, reset, enable,
+			       NULL, permanent);
 }
 
 #ifdef CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
@@ -6325,7 +6443,7 @@ unsigned long ftrace_hash_count(struct ftrace_hash *hash)
  */
 static struct ftrace_hash *hash_add(struct ftrace_hash *a, struct ftrace_hash *b)
 {
-	struct ftrace_func_entry *entry;
+	struct ftrace_func_entry *entry, *new_entry;
 	struct ftrace_hash *add;
 	int size;
 
@@ -6340,7 +6458,9 @@ static struct ftrace_hash *hash_add(struct ftrace_hash *a, struct ftrace_hash *b
 	size = 1 << b->size_bits;
 	for (int i = 0; i < size; i++) {
 		hlist_for_each_entry(entry, &b->buckets[i], hlist) {
-			if (add_ftrace_hash_entry_direct(add, entry->ip, entry->direct) == NULL) {
+			new_entry = add_ftrace_hash_entry_direct(add, entry->ip,
+								 entry->direct, entry->permanent);
+			if (new_entry == NULL) {
 				free_ftrace_hash(add);
 				return NULL;
 			}
@@ -6376,6 +6496,17 @@ int update_ftrace_direct_add(struct ftrace_ops *ops, struct ftrace_hash *hash)
 		return -EINVAL;
 
 	mutex_lock(&direct_mutex);
+
+	/*
+	 * Refuse adding a permanent direct caller while ftrace is disabled.
+	 * The first attach would be caught by __register_ftrace_function(),
+	 * but subsequent attaches update the already-registered ops without
+	 * going through it, so gate here for both.
+	 */
+	if (!ftrace_enabled && filter_hash_has_permanent(hash)) {
+		err = -EBUSY;
+		goto out_unlock;
+	}
 
 	/* Make sure requested entries are not already registered. */
 	size = 1 << hash->size_bits;
@@ -6694,9 +6825,30 @@ int ftrace_set_filter_ip(struct ftrace_ops *ops, unsigned long ip,
 			 int remove, int reset)
 {
 	ftrace_ops_init(ops);
-	return ftrace_set_addr(ops, &ip, 1, remove, reset, 1);
+	return ftrace_set_addr(ops, &ip, 1, remove, reset, 1, false);
 }
 EXPORT_SYMBOL_GPL(ftrace_set_filter_ip);
+
+/**
+ * ftrace_set_filter_ip_permanent - like ftrace_set_filter_ip, but marks the
+ * filtered address permanent so that kernel.ftrace_enabled=0 is refused while
+ * it remains attached (and the attach is refused while ftrace is disabled).
+ * @ops: the ops to set the filter with
+ * @ip: the address to add to or remove from the filter.
+ * @remove: non zero to remove the ip from the filter
+ * @reset: non zero to reset all filters before applying this filter.
+ *
+ * On 32-bit kernels permanence is unavailable; this behaves like
+ * ftrace_set_filter_ip().
+ */
+int ftrace_set_filter_ip_permanent(struct ftrace_ops *ops, unsigned long ip,
+				   int remove, int reset)
+{
+	ftrace_ops_init(ops);
+	return ftrace_set_addr(ops, &ip, 1, remove, reset, 1,
+			       FTRACE_FL_PERMANENT_SUPPORTED ? true : false);
+}
+EXPORT_SYMBOL_GPL(ftrace_set_filter_ip_permanent);
 
 /**
  * ftrace_set_filter_ips - set functions to filter on in ftrace by addresses
@@ -6717,7 +6869,7 @@ int ftrace_set_filter_ips(struct ftrace_ops *ops, unsigned long *ips,
 			  unsigned int cnt, int remove, int reset)
 {
 	ftrace_ops_init(ops);
-	return ftrace_set_addr(ops, ips, cnt, remove, reset, 1);
+	return ftrace_set_addr(ops, ips, cnt, remove, reset, 1, false);
 }
 EXPORT_SYMBOL_GPL(ftrace_set_filter_ips);
 
@@ -6764,7 +6916,7 @@ ftrace_set_regex(struct ftrace_ops *ops, unsigned char *buf, int len,
 		tmp = kstrdup(func, GFP_KERNEL);
 	}
 
-	ret = ftrace_set_hash(ops, func, len, NULL, 0, 0, reset, enable, mod);
+	ret = ftrace_set_hash(ops, func, len, NULL, 0, 0, reset, enable, mod, false);
 
 	if (tr && mod && ret < 0) {
 		/* Did tmp fail to allocate? */
@@ -9377,14 +9529,18 @@ static void ftrace_shutdown_sysctl(void)
 # define ftrace_shutdown_sysctl()      do { } while (0)
 #endif /* CONFIG_DYNAMIC_FTRACE */
 
-static bool is_permanent_ops_registered(void)
+static bool is_permanent_record_registered(void)
 {
-	struct ftrace_ops *op;
+	struct ftrace_page *pg;
+	struct dyn_ftrace *rec;
 
-	do_for_each_ftrace_op(op, ftrace_ops_list) {
-		if (op->flags & FTRACE_OPS_FL_PERMANENT)
+	if (!FTRACE_FL_PERMANENT_SUPPORTED)
+		return false;
+
+	do_for_each_ftrace_rec(pg, rec) {
+		if (rec->flags & FTRACE_FL_PERMANENT)
 			return true;
-	} while_for_each_ftrace_op(op);
+	} while_for_each_ftrace_rec();
 
 	return false;
 }
@@ -9415,7 +9571,7 @@ ftrace_enable_sysctl(const struct ctl_table *table, int write,
 		ftrace_startup_sysctl();
 
 	} else {
-		if (is_permanent_ops_registered()) {
+		if (is_permanent_record_registered()) {
 			ftrace_enabled = true;
 			return -EBUSY;
 		}

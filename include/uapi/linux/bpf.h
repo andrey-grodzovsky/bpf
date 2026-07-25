@@ -1334,6 +1334,14 @@ enum {
 	BPF_F_UPROBE_MULTI_PATH_FD    = (1U << 1),
 };
 
+/* link_create.flags used in LINK_CREATE command for tracing attach types
+ * (BPF_TRACE_FENTRY, BPF_TRACE_FEXIT, BPF_TRACE_FSESSION, BPF_MODIFY_RETURN,
+ * BPF_LSM_MAC). When set, kernel.ftrace_enabled=0 is refused while the link
+ * is attached (and attaching is refused while ftrace is disabled). Only
+ * effective on 64-bit kernels.
+ */
+#define BPF_F_TRACING_PERMANENT (1U << 0)
+
 /* link_create.netfilter.flags used in LINK_CREATE command for
  * BPF_PROG_TYPE_NETFILTER to enable IP packet defragmentation.
  */

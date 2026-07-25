@@ -1139,11 +1139,15 @@ bool kprobe_ftrace_disabled;
 static int __arm_kprobe_ftrace(struct kprobe *p, struct ftrace_ops *ops,
 			       int *cnt)
 {
+	bool permanent = p->flags & KPROBE_FLAG_PERMANENT;
 	int ret;
 
 	lockdep_assert_held(&kprobe_mutex);
 
-	ret = ftrace_set_filter_ip(ops, (unsigned long)p->addr, 0, 0);
+	if (permanent)
+		ret = ftrace_set_filter_ip_permanent(ops, (unsigned long)p->addr, 0, 0);
+	else
+		ret = ftrace_set_filter_ip(ops, (unsigned long)p->addr, 0, 0);
 	if (ret < 0)
 		return ret;
 

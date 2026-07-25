@@ -414,7 +414,8 @@ typedef int (*ftrace_ops_func_t)(struct ftrace_ops *op, unsigned long ip, enum f
 struct ftrace_hash *alloc_ftrace_hash(int size_bits);
 void free_ftrace_hash(struct ftrace_hash *hash);
 struct ftrace_func_entry *add_ftrace_hash_entry_direct(struct ftrace_hash *hash,
-						       unsigned long ip, unsigned long direct);
+						       unsigned long ip, unsigned long direct,
+						       bool permanent);
 void add_ftrace_hash_entry(struct ftrace_hash *hash, struct ftrace_func_entry *entry);
 void ftrace_hash_remove(struct ftrace_hash *hash);
 
@@ -537,6 +538,7 @@ struct ftrace_func_entry {
 	struct hlist_node hlist;
 	unsigned long ip;
 	unsigned long direct; /* for direct lookup only */
+	bool permanent;       /* attacher opted in to block ftrace_enabled=0 */
 };
 
 #ifdef CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
@@ -763,6 +765,8 @@ bool is_ftrace_trampoline(unsigned long addr);
  *  CALL_OPS_EN - the function is set up to use callsite-specific ops
  *  TOUCHED  - A callback was added since boot up
  *  MODIFIED - The function had IPMODIFY or DIRECT attached to it
+ *  PERMANENT - A callback on this record refuses ftrace_enabled=0
+ *              (64-bit only)
  *
  * When a new ftrace_ops is registered and wants a function to save
  * pt_regs, the rec->flags REGS is set. When the function has been
@@ -786,6 +790,20 @@ enum {
 	FTRACE_FL_MODIFIED	= (1UL << 19),
 };
 
+/*
+ * FTRACE_FL_PERMANENT marks a record whose attacher opted in to blocking
+ * kernel.ftrace_enabled=0. It lives above the 32-bit flag range, so it is
+ * only available where dyn_ftrace.flags (unsigned long) is 64-bit wide.
+ * On 32-bit it is defined as 0 so the feature is a compile-time no-op.
+ */
+#if BITS_PER_LONG >= 64
+#define FTRACE_FL_PERMANENT		(1UL << 32)
+#define FTRACE_FL_PERMANENT_SUPPORTED	1
+#else
+#define FTRACE_FL_PERMANENT		(0UL)
+#define FTRACE_FL_PERMANENT_SUPPORTED	0
+#endif
+
 #define FTRACE_REF_MAX_SHIFT	19
 #define FTRACE_REF_MAX		((1UL << FTRACE_REF_MAX_SHIFT) - 1)
 
@@ -799,6 +817,8 @@ struct dyn_ftrace {
 
 int ftrace_set_filter_ip(struct ftrace_ops *ops, unsigned long ip,
 			 int remove, int reset);
+int ftrace_set_filter_ip_permanent(struct ftrace_ops *ops, unsigned long ip,
+				   int remove, int reset);
 int ftrace_set_filter_ips(struct ftrace_ops *ops, unsigned long *ips,
 			  unsigned int cnt, int remove, int reset);
 int ftrace_set_filter(struct ftrace_ops *ops, unsigned char *buf,

@@ -1408,6 +1408,8 @@ struct bpf_trampoline {
 		struct bpf_tramp_image *old_image;
 		u32 old_flags;
 	} multi_attach;
+	/* true if any attached link requested ftrace_enabled protection */
+	bool permanent;
 };
 
 struct bpf_attach_target_info {

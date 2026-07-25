@@ -247,7 +247,7 @@ static struct ftrace_hash *hash_from_ip(struct bpf_trampoline *tr, void *ptr)
 		return NULL;
 	if (bpf_trampoline_use_jmp(tr->flags))
 		addr = ftrace_jmp_set(addr);
-	if (!add_ftrace_hash_entry_direct(hash, ip, addr)) {
+	if (!add_ftrace_hash_entry_direct(hash, ip, addr, tr->permanent)) {
 		free_ftrace_hash(hash);
 		return NULL;
 	}
