@@ -788,16 +788,27 @@ enum {
 	FTRACE_FL_CALL_OPS_EN	= (1UL << 21),
 	FTRACE_FL_TOUCHED	= (1UL << 20),
 	FTRACE_FL_MODIFIED	= (1UL << 19),
+#if BITS_PER_LONG >= 64
+	/*
+	 * FTRACE_FL_PERMANENT marks a record whose attacher opted in to
+	 * blocking kernel.ftrace_enabled=0. It lives above the 32-bit flag
+	 * range, so it is only available where dyn_ftrace.flags (unsigned
+	 * long) is 64-bit wide. Putting it in this enum (rather than a
+	 * standalone #define) forces the enum's underlying type to 64 bits,
+	 * which matters: every other FTRACE_FL_* clear site does
+	 * "rec->flags &= ~FTRACE_FL_XXX", and if this enum stayed 32-bit-only
+	 * that "~" would be computed in 32-bit arithmetic and zero-extended,
+	 * silently clearing this bit on every unrelated flag update.
+	 */
+	FTRACE_FL_PERMANENT	= (1UL << 32),
+#endif
 };
 
 /*
- * FTRACE_FL_PERMANENT marks a record whose attacher opted in to blocking
- * kernel.ftrace_enabled=0. It lives above the 32-bit flag range, so it is
- * only available where dyn_ftrace.flags (unsigned long) is 64-bit wide.
- * On 32-bit it is defined as 0 so the feature is a compile-time no-op.
+ * On 32-bit kernels FTRACE_FL_PERMANENT does not exist above; define it as 0
+ * so the feature is a compile-time no-op.
  */
 #if BITS_PER_LONG >= 64
-#define FTRACE_FL_PERMANENT		(1UL << 32)
 #define FTRACE_FL_PERMANENT_SUPPORTED	1
 #else
 #define FTRACE_FL_PERMANENT		(0UL)
