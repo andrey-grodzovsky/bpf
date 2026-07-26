@@ -323,6 +323,22 @@ static int direct_ops_add(struct bpf_trampoline *tr, void *ptr)
 	if (bpf_trampoline_use_jmp(tr->flags))
 		addr = ftrace_jmp_set(addr);
 
+	/*
+	 * Unlike the single-direct_ops path, tr->fops here is dedicated to
+	 * this one trampoline (one ftrace_ops per target function, same as
+	 * livepatch), so it is safe to request permanence at the ops level:
+	 * this ops will never be shared with an unrelated attacher. Must be
+	 * set before register_ftrace_direct() -- FTRACE_OPS_FL_PERMANENT is
+	 * an attribute flag that cannot be changed on an already-registered
+	 * ops. Known limitation: if the first program attached to this
+	 * trampoline is non-permanent and a later, permanent program shares
+	 * it, tr->permanent flips true but this already-registered ops
+	 * cannot be retrofitted -- direct_ops_mod() only rewrites the direct
+	 * target, it never re-registers.
+	 */
+	if (tr->permanent)
+		ops->flags |= FTRACE_OPS_FL_PERMANENT;
+
 	ret = ftrace_set_filter_ip(ops, tr->ip, 0, 1);
 	if (ret)
 		return ret;
